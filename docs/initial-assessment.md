@@ -6,7 +6,7 @@ _Researched 2026-11-16. Based on the idea and StreamVibe research brief in [todo
 
 ### v1 in one paragraph
 
-A **phone web app** (a PWA, which can be added to the home screen) with a shutter button and hold-to-talk, talking to a **Python base station** on the LAN. The base station runs the agent queue, an OpenAI-compatible LLM client, DuckDuckGo web search, reverse image search only when needed, and Parakeet speech-to-text. Bins are predefined and the LLM picks the best match. Follow-up questions go to a "Needs attention" inbox. Storage is SQLite, and every raw capture is kept. StreamVibe is **not** a dependency.
+A **phone web app** (a PWA, which can be added to the home screen) with a shutter button and hold-to-talk, talking to a **Python base station** on the LAN. The base station runs the agent queue, an OpenAI-compatible LLM client, DuckDuckGo web search, and reverse image search only when needed. It sends hold-to-talk clips to the existing **Parakeet server**. Images go to the model at the **highest resolution it accepts**. Bins are predefined and the LLM picks the best match. Follow-up questions go to a "Needs attention" inbox. Storage is SQLite, and every raw capture is kept. StreamVibe is **not** a dependency, and neither is the AIRI speech pipeline (see [AIRI findings](#findings-from-the-airi-speech-pipeline-notes)).
 
 ### Capture
 
@@ -43,8 +43,15 @@ A **phone web app** (a PWA, which can be added to the home screen) with a shutte
 
 - **LLM:** one OpenAI-compatible client, with the endpoint as a setting: Qwen3.8 Flash-Next on Strata (LAN server, the default), llama.cpp, or a cloud frontier model. Big models are assumed to run off-box, and the local GPU (24 GB) is used only for speech-to-text and any vision helpers. A fully offline fallback is just another endpoint with web search turned off.
 - **Structured output:** every schema starts with a `reasoning` field before the answer fields (`name`, `tags`, `bin`, `confidence`, ...).
-- **Speech:** reuse the pipeline from the user's modified AIRI (Silero VAD, a speech/non-speech classifier, Parakeet, end-of-speech detection). It has a known memory leak to fix. Details are pending a write-up from the Claude instance that manages that fork.
-- **Web search:** free DuckDuckGo search, as in text-generation-webui (probably the `ddgs` package; to confirm against the AIRI integration).
+- **Image resolution:** send images at the **highest resolution the model accepts**. Reading small text (model numbers, labels, fine print) is central to the app, and local inference is free and fast.
+  - The maximum image size is a setting on each endpoint. Local defaults to the largest size; cloud endpoints default to that provider's maximum, since they charge per token.
+  - The base station resizes to exactly what the endpoint allows, so the provider never scales images down in some unknown way. Phone photos (12–50 MP) are larger than any model's limit.
+  - On llama-server, set `image-max-tokens` high enough that it doesn't shrink images itself. Qwen-VL on llama-server uses one token per 32×32-pixel square (~3,700 tokens for 2576×1449).
+  - The original photo is always kept.
+- **Speech (v1):** hold-to-talk only. The user marks where speech starts and ends, so no voice detection, end-of-speech detection, wake words or echo gate are needed. Each clip goes straight to the existing Parakeet server. A plain text box on each item also works with the phone keyboard's built-in voice typing, so notes don't depend on any speech code.
+- **Speech (phase 2):** an always-on, Google Home–style pipeline for when the app is meant to work in a room. Rewrite the logic (AIRI notes, Option A), seeded with AIRI's tested defaults; don't extract AIRI's code. See [AIRI findings](#findings-from-the-airi-speech-pipeline-notes).
+- **Web search:** free DuckDuckGo search through the `ddgs` package plus `trafilatura` for page text, written fresh for this project (see the license note in [AIRI findings](#findings-from-the-airi-speech-pipeline-notes)).
+- **Untrusted content:** web search and reverse image search results are wrapped in `<untrusted_content source="...">` tags before the LLM sees them, as AIRI does.
 - **Reverse image search:** the user's existing chromedriver-driven Google search, not SerpAPI.
   - Run it only when the LLM's confidence is low, and skip it for easy items.
   - Cache results by image hash.
@@ -64,6 +71,36 @@ A **phone web app** (a PWA, which can be added to the home screen) with a shutte
 - Target: thousands to tens of thousands of items (eventually, a whole household). v1 stays simple.
 - SQLite + FTS5 (full-text search) + `sqlite-vec` (embeddings); photos on disk.
 - **Raw captures (photos + audio) are kept permanently**, so the whole inventory can be re-processed as models improve.
+
+### Findings from the AIRI speech pipeline notes
+
+_Source: a reference write-up of the user's AIRI fork (moeru-ai/airi at `0327dc8` plus local patches), produced on 2026-11-16 by the Claude instance that manages it, plus a check of the user's `textgen-tools-mcp` folder._
+
+- **The Parakeet server is already its own service.** `parakeet_server.py` (the user's own code, outside AIRI) serves an OpenAI-compatible `POST /v1/audio/transcriptions` on port 8870 and decodes uploads with ffmpeg. The base station can call it directly. It can probably take the phone's native webm/opus without converting to WAV first (to confirm).
+- **It runs on an RTX A6000 (48 GB)**, not the 24 GB PC, so it is presumably on the LAN server. That suggests running the base station there too (to confirm).
+- **Only the base station talks to Parakeet.** The server has known gaps: no API key, CORS open to every site, no upload size limit, and ffmpeg's protocol whitelist isn't set. The phone talks only to the base station. The ffmpeg whitelist is still worth fixing, because user audio goes through it.
+- **AIRI has no separate "is this speech" classifier.** The filtering is Silero's score with two thresholds, the minimum length, and an echo gate that ignores the mic while the AI talks.
+- **The memory leak doesn't affect this project.** It's in AIRI's Electron renderer (JS heap growing ~530–560 MB/hour during hands-free listening), not in Parakeet.
+- **Tested defaults for phase 2 voice detection:** Silero VAD on 512-sample (32 ms) windows at 16 kHz.
+  - Start speech when the score reaches 0.6.
+  - Continue while it stays above 0.18 (0.6 × 0.3).
+  - End after 1200 ms of silence.
+  - Drop segments shorter than 300 ms.
+  - Keep 360 ms of audio from before speech starts.
+- **Wake words in AIRI match the transcript text, not the sound.** For a spoken "snap" in phase 2, that adds ~1.2 s of silence detection plus transcription time before "snap" is noticed.
+  - Keep ~5 s of frames, and choose frames by the **time the "snap" segment started**, not the time it was recognised.
+  - An acoustic keyword spotter would be faster. AIRI has an unused `detectWakeWord` hook for one, and openWakeWord is a candidate (not checked).
+  - AIRI's `stripWakePhrase` is a small, pure function. It can be copied as long as AIRI's MIT notice is kept.
+- **Web search sources:**
+  - AIRI's built-in search is **Tavily**, a paid API that needs a key.
+  - The free DuckDuckGo search is in the user's `textgen-tools-mcp` server (`ddgs==9.14.1` + `trafilatura`), with good protection against fetching internal network addresses.
+  - ⚠️ **That folder is AGPL-3.0**, because it's copied from oobabooga's text-generation-webui. **Don't copy its code into this project**, or the whole app would come under AGPL. Write our own small module that calls `ddgs` and `trafilatura` directly, reusing only the *idea* of the address checks. (`ddgs` is believed to be MIT and `trafilatura` Apache-2.0; not verified.)
+- **Licenses:**
+  - AIRI is MIT; code copied from it must keep the MIT notice.
+  - Parakeet-unified-en-0.6b is **not** CC-BY-4.0, as the AIRI notes guessed. Its [model card](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) says use is governed by the **NVIDIA Open Model License Agreement**. That's fine for personal use; read it before distributing the app with the model.
+- **Audio storage conflict:** AIRI never stores audio. This doc keeps raw captures. Suggestion, not yet confirmed:
+  - keep deliberate hold-to-talk voice notes;
+  - in phase 2, keep only speech attached to an item, never background audio.
 
 ### Phases
 
@@ -118,11 +155,15 @@ Resolved in review:
 - **Offline:** online is the intended use. A fully offline fallback is supported, but it's lower quality and web search is off.
 - **Inventory size:** eventually thousands to tens of thousands of items.
 
+- **AIRI speech pipeline:** documented; see [AIRI findings](#findings-from-the-airi-speech-pipeline-notes).
+- **Web search library:** `ddgs` (DuckDuckGo), written fresh for this project to avoid AGPL.
+
 Still open:
 
 - Do bins already have labels or QR codes?
-- Should the base station run on the PC or on the LAN server?
-- Details of the AIRI speech pipeline (pending a write-up from the Claude instance that manages that fork).
+- Base station on the PC or the LAN server? (Leaning toward the LAN server, where Parakeet appears to run.)
+- Confirm the audio-storage rule: keep hold-to-talk notes, never background audio?
+- Does the Parakeet server accept webm/opus uploads directly?
 
 ## Sources
 
